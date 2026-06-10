@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# wifi — interactive Wi-Fi switcher for netplan + systemd-networkd + cloud-init.
+# Persists across reboots by writing cloud-init's network SOURCE file, which
+# cloud-init re-renders into 50-cloud-init.yaml on every boot.
+#
+# Commands:
+#   wifi                 Scan and connect to a network (interactive)
+#   wifi --auto          Configure ALL saved networks for automatic
+#                        connect/failover (joins whichever is in range)
+#   wifi --list          List saved networks
+#   wifi --forget [SSID] Forget a saved network (interactive if no SSID)
+#   wifi --help          Show this help
+set -euo pipefail
+
+IFACE="wlp0s20f3"
+CLOUD_CFG="/etc/cloud/cloud.cfg.d/90-wifi.cfg"   # persistent source (survives reboot)
+NETPLAN="/etc/netplan/50-cloud-init.yaml"        # live file (applied now)
+WIFI_STORE="/etc/wifi-credentials"               # remembered SSID->password (root-only)
+SELF_BIN="/usr/local/bin/wifi"                   # where 'wifi' is installed on PATH
+STATE_DIR="/var/lib/wifi-tool"                   # install state
+MARKER="$STATE_DIR/installed"                    # first-run marker
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  wifi                 Scan and connect to a network (interactive)
+  wifi --auto          Configure ALL saved networks for auto connect/failover
+  wifi --list          List saved networks
+  wifi --forget [SSID] Forget a saved network (interactive if no SSID)
+  wifi --install       (Re)install the 'wifi' command + dependencies
+  wifi --help          Show this help
+USAGE
+}
+
+# --- help works without sudo -------------------------------------------------
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+# --- elevate -----------------------------------------------------------------
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  echo "[*] Elevating with sudo..."
+  exec sudo -- "$0" "$@"
+fi
+
+# --- saved-password store ----------------------------------------------------
+# Each line: "<base64 ssid> <base64 password>". base64 keeps spaces/specials
+# out of the parsing and the file is mode 600 so only root can read it.
+store_get() {  # $1=ssid -> echoes saved password (empty if none)
+  [[ -f "$WIFI_STORE" ]] || return 0
+  local key line
+  key="$(printf '%s' "$1" | base64 -w0)"
+  line="$(grep -m1 "^${key} " "$WIFI_STORE" 2>/dev/null)" || return 0
+  [[ -n "$line" ]] || return 0
+  printf '%s' "${line#* }" | base64 -d 2>/dev/null || true
+}
+
+store_put() {  # $1=ssid $2=password  (no-op for empty/open networks)
+  [[ -n "$2" ]] || return 0
+  local key val
+  key="$(printf '%s' "$1" | base64 -w0)"
+  val="$(printf '%s' "$2" | base64 -w0)"
+  touch "$WIFI_STORE"; chmod 600 "$WIFI_STORE"
+  grep -v "^${key} " "$WIFI_STORE" > "${WIFI_STORE}.tmp" 2>/dev/null || true
+  mv "${WIFI_STORE}.tmp" "$WIFI_STORE" 2>/dev/null || : > "$WIFI_STORE"
+  printf '%s %s\n' "$key" "$val" >> "$WIFI_STORE"
+  chmod 600 "$WIFI_STORE"
+}
+
+store_forget() {  # $1=ssid
+  [[ -f "$WIFI_STORE" ]] || return 0
+  local key
+  key="$(printf '%s' "$1" | base64 -w0)"
+  grep -v "^${key} " "$WIFI_STORE" > "${WIFI_STORE}.tmp" 2>/dev/null || true
+  mv "${WIFI_STORE}.tmp" "$WIFI_STORE" 2>/dev/null || true
+  chmod 600 "$WIFI_STORE" 2>/dev/null || true
+}
+
+store_list() {  # echoes each saved SSID, one per line
+  [[ -f "$WIFI_STORE" ]] || return 0
+  local key _rest
+  while read -r key _rest; do
+    [[ -n "$key" ]] || continue
+    printf '%s' "$key" | base64 -d 2>/dev/null; echo
+  done < "$WIFI_STORE"
+}
+
+# --- masked password input ---------------------------------------------------
+# Echoes '*' per character while typing, supports backspace, and Tab toggles
+# between hidden ('*') and revealed (plaintext) so you can verify what you typed.
+# Result is returned in the global REPLY_PW.
+read_password() {  # $1=prompt
+  local prompt="${1:-Password: }" pw="" char show=0 n
+  REPLY_PW=""
+  printf '%s' "$prompt"
+  printf '(Tab=show/hide) '
+  while IFS= read -r -s -n1 char; do
+    case "$char" in
+      '')                       # Enter -> done
+        break ;;
+      $'\x7f'|$'\x08')          # Backspace / Delete
+        if [[ -n "$pw" ]]; then
+          pw="${pw%?}"
+          printf '\b \b'
+        fi ;;
+      $'\t')                    # Tab -> toggle reveal
+        show=$(( ! show ))
+        n=${#pw}
+        if (( n > 0 )); then
+          printf '\b%.0s' $(seq "$n")   # cursor back over the field
+          printf ' %.0s'  $(seq "$n")   # blank it
+          printf '\b%.0s' $(seq "$n")   # cursor back again
+          if (( show )); then printf '%s' "$pw"; else printf '*%.0s' $(seq "$n"); fi
+        fi ;;
+      *)
+        pw+="$char"
+        if (( show )); then printf '%s' "$char"; else printf '*'; fi ;;
+    esac
+  done
+  printf '\n'
+  REPLY_PW="$pw"
+}
+
+# --- netplan config writer ---------------------------------------------------
+# Reads the global APS array; each entry is "<ssid><TAB><password>" (empty
+# password = open network). Multiple entries => the system auto-connects to
+# whichever access-point is in range and fails over if one goes offline.
+APS=()
+emit() {
+  echo "network:"
+  echo "  version: 2"
+  echo "  ethernets: {}"
+  echo "  wifis:"
+  echo "    $IFACE:"
+  echo "      dhcp4: true"
+  echo "      access-points:"
+  local entry name pw
+  for entry in "${APS[@]}"; do
+    name="${entry%%$'\t'*}"; pw="${entry#*$'\t'}"
+    if [[ -n "$pw" ]]; then
+      echo "        \"$name\":"
+      echo "          password: \"$pw\""
+    else
+      echo "        \"$name\": {}"
+    fi
+  done
+}
+
+apply_config() {  # writes both files (backup first), then netplan generate/apply
+  { echo "# Managed by 'wifi'. cloud-init renders this into $NETPLAN on every boot."; emit; } \
+    > "$CLOUD_CFG"
+  chmod 600 "$CLOUD_CFG"
+  echo "[*] Wrote persistent source: $CLOUD_CFG"
+
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$NETPLAN" "${NETPLAN}.bak-${stamp}" 2>/dev/null && \
+    echo "[*] Backup: ${NETPLAN}.bak-${stamp}"
+  { echo "# Generated by 'wifi'; persistent source is $CLOUD_CFG"; emit; } > "$NETPLAN"
+  chmod 600 "$NETPLAN"
+  echo "[*] Wrote live config: $NETPLAN"
+
+  echo; echo "$ netplan generate"; netplan generate
+  echo; echo "$ netplan apply";    netplan apply
+  echo; echo "[*] Waiting for the link to come up..."; sleep 6
+  echo "$ networkctl status $IFACE"; networkctl status "$IFACE" || true
+  echo
+  echo "[done] Settings will survive reboot (cloud-init re-renders from $CLOUD_CFG)."
+  echo "       Restore previous: sudo cp ${NETPLAN}.bak-${stamp} $NETPLAN && sudo netplan apply"
+}
+
+# --- first-run self-install --------------------------------------------------
+# Idempotent: does its work once (gated by $MARKER), then becomes a no-op.
+# Ensures the 'iw' dependency is present and copies this script onto PATH as
+# 'wifi' (also refreshes an out-of-date installed copy).
+self_install() {  # $1=force -> run even if the marker exists
+  local force="${1:-}"
+  [[ -z "$force" && -e "$MARKER" ]] && return 0
+
+  echo "[*] ${force:+Re-}Installing 'wifi'..."
+  mkdir -p "$STATE_DIR"
+
+  # dependency: iw (used for scanning available networks)
+  if ! command -v iw >/dev/null 2>&1; then
+    echo "[*] Installing dependency 'iw'..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq 2>/dev/null && apt-get install -y -qq iw 2>/dev/null \
+        || echo "[!] Couldn't auto-install 'iw' — install it manually: sudo apt install iw"
+    else
+      echo "[!] 'iw' is missing and apt-get isn't available — install it manually."
+    fi
+  fi
+
+  # put the 'wifi' command on PATH (copy self if missing or out of date)
+  local self; self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  if [[ "$self" != "$SELF_BIN" ]] && ! cmp -s "$self" "$SELF_BIN" 2>/dev/null; then
+    if install -m 755 "$self" "$SELF_BIN" 2>/dev/null; then
+      echo "[*] Installed command: $SELF_BIN  (run 'wifi' from anywhere)"
+    else
+      echo "[!] Couldn't write $SELF_BIN — keep running it from $self"
+    fi
+  fi
+
+  : > "$MARKER"
+  echo "[*] Install complete."
+  echo
+}
+
+# --- commands ----------------------------------------------------------------
+do_list() {
+  local any=0 ssid
+  echo "  Saved networks:"
+  while IFS= read -r ssid; do
+    [[ -n "$ssid" ]] || continue
+    any=1; echo "   - $ssid"
+  done < <(store_list)
+  [[ $any -eq 1 ]] || echo "   (none)"
+}
+
+do_forget() {  # $1=ssid (optional; interactive picker if absent)
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    local list=() ssid i=0
+    while IFS= read -r ssid; do [[ -n "$ssid" ]] && list+=("$ssid"); done < <(store_list)
+    if [[ ${#list[@]} -eq 0 ]]; then echo "  (no saved networks)"; exit 0; fi
+    echo "  Saved networks:"
+    for ssid in "${list[@]}"; do i=$((i+1)); printf "   %2d) %s\n" "$i" "$ssid"; done
+    read -rp "  Forget which? [1-$i]: " n
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= i )) || { echo "[!] Invalid choice."; exit 1; }
+    target="${list[$((n-1))]}"
+  fi
+  if [[ -z "$(store_get "$target")" ]]; then
+    echo "[!] No saved network named \"$target\"."; exit 1
+  fi
+  store_forget "$target"
+  echo "[*] Forgot \"$target\"."
+}
+
+do_auto() {  # configure every saved network for automatic connect/failover
+  APS=()
+  local ssid
+  while IFS= read -r ssid; do
+    [[ -n "$ssid" ]] || continue
+    APS+=("$ssid"$'\t'"$(store_get "$ssid")")
+  done < <(store_list)
+  if [[ ${#APS[@]} -eq 0 ]]; then
+    echo "[!] No saved networks yet. Run 'wifi' to connect to one first."; exit 1
+  fi
+
+  echo "=== Auto-failover across ${#APS[@]} saved network(s) ==="
+  local entry
+  for entry in "${APS[@]}"; do echo "   - ${entry%%$'\t'*}"; done
+  echo
+  echo "  The system will automatically join whichever of these is in range and"
+  echo "  fail over to another if the current one goes offline (no script needed)."
+  read -rp "  Apply? [y/N]: " ok
+  [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted. No changes made."; exit 0; }
+  apply_config
+}
+
+do_connect() {  # interactive scan-and-connect
+  command -v iw >/dev/null || { echo "[!] 'iw' not installed."; exit 1; }
+
+  scan() {
+    iw dev "$IFACE" scan 2>/dev/null | awk '
+      /^BSS / {sig=""}
+      /signal:/ {sig=$2}
+      /^[[:space:]]*SSID:/ {
+        s=$0; sub(/^[[:space:]]*SSID:[[:space:]]?/,"",s);
+        if (s!="" && s !~ /\\x00/) print sig"\t"s
+      }' | sort -t$'\t' -k1,1 -rn | awk -F'\t' '!seen[$2]++ {printf "%s\t%s\n", $1, $2}'
+  }
+
+  local SSID="" choice sig name tag i
+  while true; do
+    echo "[*] Bringing $IFACE up and scanning..."
+    ip link set "$IFACE" up 2>/dev/null || true
+
+    mapfile -t ROWS < <(scan)
+    # one retry — the radio is often busy right after link-up
+    if [[ ${#ROWS[@]} -eq 0 ]]; then sleep 2; mapfile -t ROWS < <(scan); fi
+
+    echo
+    echo "  Available networks:"
+    i=0
+    SSIDS=()
+    for row in "${ROWS[@]}"; do
+      sig="${row%%$'\t'*}"; name="${row#*$'\t'}"
+      i=$((i+1)); SSIDS+=("$name")
+      tag=""; [[ -n "$(store_get "$name")" ]] && tag="  (saved)"
+      printf "   %2d) %-32s %s dBm%s\n" "$i" "$name" "$sig" "$tag"
+    done
+    printf "   %2d) <enter SSID manually / hidden network>\n" "$((i+1))"
+    printf "    r) rescan / refresh\n"
+    echo
+
+    read -rp "  Choose a network [1-$((i+1)), or r to rescan]: " choice
+    if [[ "$choice" =~ ^[Rr]$ ]]; then echo; continue; fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > i+1 )); then
+      echo "[!] Invalid choice."; echo; continue
+    fi
+
+    if (( choice == i+1 )); then
+      read -rp "  Enter SSID: " SSID
+    else
+      SSID="${SSIDS[$((choice-1))]}"
+    fi
+    [[ -n "$SSID" ]] || { echo "[!] SSID cannot be empty."; echo; continue; }
+    break
+  done
+
+  # password (reuse saved one if we have it)
+  local PW="" SAVED_PW usesaved
+  SAVED_PW="$(store_get "$SSID")"
+  if [[ -n "$SAVED_PW" ]]; then
+    echo "  [*] Saved password found for \"$SSID\"."
+    read -rp "  Use saved password? [Y/n]: " usesaved
+    [[ "$usesaved" =~ ^[Nn]$ ]] || PW="$SAVED_PW"
+  fi
+  if [[ -z "$PW" ]]; then
+    read_password "  Password (leave blank for OPEN network): "
+    PW="$REPLY_PW"
+    if [[ -n "$PW" && ${#PW} -lt 8 ]]; then
+      echo "[!] WPA passwords must be at least 8 characters."; exit 1
+    fi
+  fi
+
+  echo
+  echo "=== Will configure ==="
+  echo "  Interface : $IFACE"
+  echo "  SSID      : $SSID"
+  echo "  Security  : $([[ -n "$PW" ]] && echo WPA || echo OPEN)"
+  echo "======================"
+  read -rp "  Apply and persist? [y/N]: " ok
+  [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted. No changes made."; exit 0; }
+
+  # remember the password before we (maybe) build the failover list
+  store_put "$SSID" "$PW"
+  [[ -n "$PW" ]] && echo "[*] Saved password for \"$SSID\" (won't ask next time)."
+
+  # offer to keep every saved network configured so failover is automatic
+  APS=("$SSID"$'\t'"$PW")
+  local saved_count auto ssid
+  saved_count="$(store_list | grep -c . || true)"
+  if (( saved_count > 1 )); then
+    echo
+    echo "  You have $saved_count saved networks. Configure ALL of them so the"
+    echo "  system auto-connects to whichever is available and fails over?"
+    read -rp "  Enable auto-failover across all saved networks? [y/N]: " auto
+    if [[ "$auto" =~ ^[Yy]$ ]]; then
+      APS=()
+      while IFS= read -r ssid; do
+        [[ -n "$ssid" ]] || continue
+        APS+=("$ssid"$'\t'"$(store_get "$ssid")")
+      done < <(store_list)
+      echo "[*] Configuring ${#APS[@]} networks for auto-failover."
+    fi
+  fi
+
+  apply_config
+}
+
+# --- dispatch ----------------------------------------------------------------
+cmd="${1:-connect}"
+
+# explicit (re)install, then auto-install on first run for every other command
+if [[ "$cmd" == "--install" || "$cmd" == "install" || "$cmd" == "--reinstall" ]]; then
+  self_install force; exit 0
+fi
+self_install   # no-op after the first successful run
+
+case "$cmd" in
+  --list|list)          do_list ;;
+  --forget|forget)      do_forget "${2:-}" ;;
+  --auto|auto|--all)    do_auto ;;
+  connect|"")           do_connect ;;
+  *) echo "[!] Unknown command: $cmd"; echo; usage; exit 1 ;;
+esac

@@ -1,0 +1,25 @@
+# NEVER commit Wi-Fi credentials or live network configuration.
+# The script stores saved passwords in /etc/wifi-credentials (outside this repo),
+# but these patterns guard against anything sensitive ever landing here.
+wifi-credentials
+*credentials*
+*.creds
+*.secret
+secrets*
+
+# Live / generated netplan + cloud-init network files (may contain PSKs)
+90-wifi.cfg
+50-cloud-init.yaml
+*cloud-init*.yaml
+*.bak-*
+netplan*.yaml
+
+# Install marker / state
+installed
+.installed
+state/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

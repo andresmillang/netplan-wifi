@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# wifi — interactive Wi-Fi switcher for netplan + systemd-networkd + cloud-init.
+# wifi — interactive Wi-Fi + Ethernet switcher for netplan + systemd-networkd + cloud-init.
 # Persists across reboots by writing cloud-init's network SOURCE file, which
 # cloud-init re-renders into 50-cloud-init.yaml on every boot.
 #
+# Ethernet is always configured (DHCP, lower route-metric) so a plugged-in cable
+# is preferred automatically and the system falls back to Wi-Fi when unplugged.
+#
 # Commands:
 #   wifi                 Scan and connect to a network (interactive)
+#   wifi --status        Show connection / internet / IP status
 #   wifi --auto          Configure ALL saved networks for automatic
 #                        connect/failover (joins whichever is in range)
 #   wifi --list          List saved networks
@@ -12,7 +16,8 @@
 #   wifi --help          Show this help
 set -euo pipefail
 
-IFACE="wlp0s20f3"
+IFACE="wlp0s20f3"                                # Wi-Fi interface
+ETH_IFACE="enp0s31f6"                            # wired interface (preferred when present)
 CLOUD_CFG="/etc/cloud/cloud.cfg.d/90-wifi.cfg"   # persistent source (survives reboot)
 NETPLAN="/etc/netplan/50-cloud-init.yaml"        # live file (applied now)
 WIFI_STORE="/etc/wifi-credentials"               # remembered SSID->password (root-only)
@@ -20,10 +25,21 @@ SELF_BIN="/usr/local/bin/wifi"                   # where 'wifi' is installed on 
 STATE_DIR="/var/lib/wifi-tool"                   # install state
 MARKER="$STATE_DIR/installed"                    # first-run marker
 
+WIFI_METRIC=600                                  # Wi-Fi route metric (higher = fallback)
+ETH_METRIC=100                                   # Ethernet route metric (lower  = preferred)
+
+# --- pretty output -----------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_G=$'\e[32m'; C_R=$'\e[31m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_0=$'\e[0m'
+else
+  C_G=""; C_R=""; C_Y=""; C_B=""; C_0=""
+fi
+
 usage() {
   cat <<'USAGE'
 Usage:
-  wifi                 Scan and connect to a network (interactive)
+  wifi                 Scan and connect to a network (interactive, one-and-done)
+  wifi --status        Show connection / internet / IP status
   wifi --auto          Configure ALL saved networks for auto connect/failover
   wifi --list          List saved networks
   wifi --forget [SSID] Forget a saved network (interactive if no SSID)
@@ -32,7 +48,7 @@ Usage:
 USAGE
 }
 
-# --- help works without sudo -------------------------------------------------
+# --- help / status work without sudo where possible --------------------------
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
 esac
@@ -125,14 +141,24 @@ read_password() {  # $1=prompt
 # Reads the global APS array; each entry is "<ssid><TAB><password>" (empty
 # password = open network). Multiple entries => the system auto-connects to
 # whichever access-point is in range and fails over if one goes offline.
+# Ethernet is always emitted (DHCP, lower metric, optional) so a wired cable
+# is preferred automatically without ever blocking boot when it's unplugged.
 APS=()
 emit() {
   echo "network:"
   echo "  version: 2"
-  echo "  ethernets: {}"
+  echo "  ethernets:"
+  echo "    $ETH_IFACE:"
+  echo "      dhcp4: true"
+  echo "      optional: true"                 # never block boot when no cable is plugged in
+  echo "      dhcp4-overrides:"
+  echo "        route-metric: $ETH_METRIC"    # lower than Wi-Fi => wired wins when present
   echo "  wifis:"
   echo "    $IFACE:"
   echo "      dhcp4: true"
+  echo "      optional: true"
+  echo "      dhcp4-overrides:"
+  echo "        route-metric: $WIFI_METRIC"   # higher than Ethernet => Wi-Fi is the fallback
   echo "      access-points:"
   local entry name pw
   for entry in "${APS[@]}"; do
@@ -162,7 +188,7 @@ apply_config() {  # writes both files (backup first), then netplan generate/appl
   echo; echo "$ netplan generate"; netplan generate
   echo; echo "$ netplan apply";    netplan apply
   echo; echo "[*] Waiting for the link to come up..."; sleep 6
-  echo "$ networkctl status $IFACE"; networkctl status "$IFACE" || true
+  do_status
   echo
   echo "[done] Settings will survive reboot (cloud-init re-renders from $CLOUD_CFG)."
   echo "       Restore previous: sudo cp ${NETPLAN}.bak-${stamp} $NETPLAN && sudo netplan apply"
@@ -203,6 +229,57 @@ self_install() {  # $1=force -> run even if the marker exists
   : > "$MARKER"
   echo "[*] Install complete."
   echo
+}
+
+# --- status ------------------------------------------------------------------
+# Answers, at a glance: connected? internet? which link is active? what IPs?
+do_status() {
+  local wssid eth_state route_dev active lan_ip inet pub_ip
+  if command -v iw >/dev/null 2>&1; then
+    wssid="$(iw dev "$IFACE" link 2>/dev/null | sed -n 's/^[[:space:]]*SSID:[[:space:]]*//p' | head -1)"
+  else
+    wssid=""
+  fi
+  if [[ "$(cat "/sys/class/net/$ETH_IFACE/carrier" 2>/dev/null || echo 0)" == "1" ]]; then
+    eth_state="cable connected"
+  else
+    eth_state="no cable"
+  fi
+  route_dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  lan_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
+  case "$route_dev" in
+    "$ETH_IFACE") active="Ethernet ($ETH_IFACE)" ;;
+    "$IFACE")     active="Wi-Fi ($IFACE)" ;;
+    "")           active="" ;;
+    *)            active="$route_dev" ;;
+  esac
+  if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then inet="yes"; else inet="no"; fi
+  if [[ "$inet" == "yes" ]]; then
+    pub_ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo '?')"
+  else
+    pub_ip="—"
+  fi
+
+  echo
+  echo "  ${C_B}=== Network status ===${C_0}"
+  if [[ -n "$active" ]]; then
+    printf "  Status    : %sCONNECTED%s  (via %s)\n" "$C_G" "$C_0" "$active"
+  else
+    printf "  Status    : %sNOT CONNECTED%s\n" "$C_R" "$C_0"
+  fi
+  if [[ -n "$wssid" ]]; then
+    printf "  Wi-Fi     : connected to \"%s\"\n" "$wssid"
+  else
+    printf "  Wi-Fi     : %snot connected%s\n" "$C_Y" "$C_0"
+  fi
+  printf "  Ethernet  : %s\n" "$eth_state"
+  if [[ "$inet" == "yes" ]]; then
+    printf "  Internet  : %syes%s\n" "$C_G" "$C_0"
+  else
+    printf "  Internet  : %sno%s\n" "$C_R" "$C_0"
+  fi
+  printf "  LAN IP    : %s\n" "${lan_ip:-—}"
+  printf "  Public IP : %s\n" "$pub_ip"
 }
 
 # --- commands ----------------------------------------------------------------
@@ -249,15 +326,11 @@ do_auto() {  # configure every saved network for automatic connect/failover
   echo "=== Auto-failover across ${#APS[@]} saved network(s) ==="
   local entry
   for entry in "${APS[@]}"; do echo "   - ${entry%%$'\t'*}"; done
-  echo
-  echo "  The system will automatically join whichever of these is in range and"
-  echo "  fail over to another if the current one goes offline (no script needed)."
-  read -rp "  Apply? [y/N]: " ok
-  [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted. No changes made."; exit 0; }
+  echo "  Joining whichever is in range; wired cable still takes priority."
   apply_config
 }
 
-do_connect() {  # interactive scan-and-connect
+do_connect() {  # interactive scan-and-connect (one-and-done, no confirmations)
   command -v iw >/dev/null || { echo "[!] 'iw' not installed."; exit 1; }
 
   scan() {
@@ -286,7 +359,7 @@ do_connect() {  # interactive scan-and-connect
     for row in "${ROWS[@]}"; do
       sig="${row%%$'\t'*}"; name="${row#*$'\t'}"
       i=$((i+1)); SSIDS+=("$name")
-      tag=""; [[ -n "$(store_get "$name")" ]] && tag="  (saved)"
+      tag=""; [[ -n "$(store_get "$name")" ]] && tag="  ${C_G}(saved)${C_0}"
       printf "   %2d) %-32s %s dBm%s\n" "$i" "$name" "$sig" "$tag"
     done
     printf "   %2d) <enter SSID manually / hidden network>\n" "$((i+1))"
@@ -308,15 +381,13 @@ do_connect() {  # interactive scan-and-connect
     break
   done
 
-  # password (reuse saved one if we have it)
-  local PW="" SAVED_PW usesaved
+  # password: use the saved one automatically; only ask if we don't have it
+  local PW="" SAVED_PW ssid
   SAVED_PW="$(store_get "$SSID")"
   if [[ -n "$SAVED_PW" ]]; then
-    echo "  [*] Saved password found for \"$SSID\"."
-    read -rp "  Use saved password? [Y/n]: " usesaved
-    [[ "$usesaved" =~ ^[Nn]$ ]] || PW="$SAVED_PW"
-  fi
-  if [[ -z "$PW" ]]; then
+    PW="$SAVED_PW"
+    echo "  [*] Using saved password for \"$SSID\"."
+  else
     read_password "  Password (leave blank for OPEN network): "
     PW="$REPLY_PW"
     if [[ -n "$PW" && ${#PW} -lt 8 ]]; then
@@ -324,37 +395,19 @@ do_connect() {  # interactive scan-and-connect
     fi
   fi
 
-  echo
-  echo "=== Will configure ==="
-  echo "  Interface : $IFACE"
-  echo "  SSID      : $SSID"
-  echo "  Security  : $([[ -n "$PW" ]] && echo WPA || echo OPEN)"
-  echo "======================"
-  read -rp "  Apply and persist? [y/N]: " ok
-  [[ "$ok" =~ ^[Yy]$ ]] || { echo "Aborted. No changes made."; exit 0; }
-
-  # remember the password before we (maybe) build the failover list
+  # remember the password so we never ask again
   store_put "$SSID" "$PW"
-  [[ -n "$PW" ]] && echo "[*] Saved password for \"$SSID\" (won't ask next time)."
 
-  # offer to keep every saved network configured so failover is automatic
+  # Auto-failover is ON by default: configure the selected network PLUS every
+  # other saved network, so the system joins whichever is in range and fails
+  # over automatically. No prompt — this is the friction-free default.
   APS=("$SSID"$'\t'"$PW")
-  local saved_count auto ssid
-  saved_count="$(store_list | grep -c . || true)"
-  if (( saved_count > 1 )); then
-    echo
-    echo "  You have $saved_count saved networks. Configure ALL of them so the"
-    echo "  system auto-connects to whichever is available and fails over?"
-    read -rp "  Enable auto-failover across all saved networks? [y/N]: " auto
-    if [[ "$auto" =~ ^[Yy]$ ]]; then
-      APS=()
-      while IFS= read -r ssid; do
-        [[ -n "$ssid" ]] || continue
-        APS+=("$ssid"$'\t'"$(store_get "$ssid")")
-      done < <(store_list)
-      echo "[*] Configuring ${#APS[@]} networks for auto-failover."
-    fi
-  fi
+  while IFS= read -r ssid; do
+    [[ -n "$ssid" ]] || continue
+    [[ "$ssid" == "$SSID" ]] && continue
+    APS+=("$ssid"$'\t'"$(store_get "$ssid")")
+  done < <(store_list)
+  (( ${#APS[@]} > 1 )) && echo "  [*] Auto-failover across ${#APS[@]} saved networks."
 
   apply_config
 }
@@ -369,6 +422,7 @@ fi
 self_install   # no-op after the first successful run
 
 case "$cmd" in
+  --status|status|-s)   do_status ;;
   --list|list)          do_list ;;
   --forget|forget)      do_forget "${2:-}" ;;
   --auto|auto|--all)    do_auto ;;
